@@ -1,0 +1,865 @@
+---
+title: "Housing Prices"
+author: "Lupita Sahu"
+date: "2 September 2019"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, cache=TRUE, warning=FALSE )
+```
+
+# Introduction
+
+The aim of this project is to predict Sale Prices of houses based on their different features. This project was taken from a Kaggle competition. The link to the competition is here:
+<https://www.kaggle.com/c/house-prices-advanced-regression-techniques/overview>
+
+We have a train dataset to train the model and apply the same model on test dataset and submit the predicted Sale price for evaluation. Kaggle will take the predicted price and return the RMSE. For the simplicity and brevity of the report most of the code is not shown in this report. The R script contains all the codes.
+
+You will have to download the data "house-prices-advanced-regression-techniques.zip" from Github link
+<https://github.com/SLupita/HousingPricePrediction_Kaggle> and paste in your working directory, if you want to run the R script.
+
+I have explored a variety of machine learning models including the simple linear regression. Random Forest and GBM gave good accuracy, but GBM performed best after hypertuning. I have finally considered a hypertuned GBM model for our final submission.
+
+```{r}
+# Loading libraries
+list.of.packages <- c("tidyverse", "caret","data.table","dummies","corrplot",
+                      "robustHD","gbm","gridExtra","missForest")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+
+library(tidyverse)
+library(caret)
+library(data.table)
+library(dummies)
+library(corrplot)
+library(missForest)
+library(gbm)
+library(robustHD)
+library(gridExtra)
+```
+
+# The data
+We will first load the data. Since the zip file already downloaded, we are just going to unzip and look at the files. The files where we have our data are:
+train.csv and test.csv.
+
+```{r}
+## Loading the data
+unzip("house-prices-advanced-regression-techniques.zip", exdir="house-prices-advanced-regression-techniques")
+
+list_of_files <- list.files("./house-prices-advanced-regression-techniques", full.names = TRUE)
+
+train <- read.csv(list_of_files[4])
+test <- read.csv(list_of_files[3])
+```
+
+
+## Exploratory analysis
+Let's look at the train and test datasets. There are 81 variables in total in train dataset and 80 in test dataset. Some of them have NA values. We will deal with them later in this project.
+
+```{r}
+dim(train)
+summary(train)
+
+dim(test)
+colnames(test)
+```
+
+Test dataset does not contain the response variable i.e. SalePrice, which is what we need to predict and submit for evaluation.
+
+Let's look at the data distribution for various variables. I'm including few graphs here as including graphs for all 80 predictor variables will dramatically increase the length of the report.
+
+```{r}
+# SalePrice
+hist(train$SalePrice)
+
+# LotFrontage
+train %>% ggplot(aes(LotFrontage, SalePrice)) + geom_point() + geom_smooth()
+train[train$BsmtFinSF1>0 & train$BsmtFinSF1<4000,] %>% ggplot(aes(BsmtFinSF1, SalePrice)) + geom_point() + geom_smooth()
+```
+
+From the following 2 graphs it looks like there is an outlier.
+
+```{r}
+train %>% ggplot(aes(X1stFlrSF, SalePrice)) + geom_point() + geom_smooth()
+train %>% ggplot(aes(GrLivArea, SalePrice)) + geom_point() + geom_smooth()
+```
+
+## Data wrangling
+
+We will remove the data where GrLivArea is less than 5000 to get rid of the outlier as the presence of an outlier can drastically affect the performance of our machine learning model.
+
+```{r}
+train <- train[train$GrLivArea<5000,]
+```
+
+Similarly removing data where LotFrontage is less than 300 to remove the outlier.
+
+```{r}
+train %>% ggplot(aes(LotFrontage, SalePrice)) + geom_point() + geom_smooth()
+train <- train[train$LotFrontage<200 | is.na(train$LotFrontage)==TRUE,]
+```
+
+The graphs after removing the outlier:
+
+```{r}
+train %>% ggplot(aes(LotFrontage, SalePrice)) + geom_point() + geom_smooth()
+```
+
+It looks a little better now.
+
+We will merge train and test datasets for easier manipulations auch as: imputing NA values, removing columns with least variance etc.
+
+```{r}
+# Keeping SalePrice aside, removing the same from train set and then combining train and test datasets
+SalePrice <- train$SalePrice
+total <- rbind(train[-which(names(train) %in% c("SalePrice"))],test)
+```
+
+### Separating factor and continuous variables
+
+MSSubClass, OverallQual, OverallCond, MoSold and YrSold are considered as continuous variables while they should be categorical.
+wSo we Will convert them first before seggregating.
+
+```{r}
+total$MSSubClass <- as.factor(total$MSSubClass)
+total$OverallQual <- as.factor(total$OverallQual)
+total$OverallCond <- as.factor(total$OverallCond)
+total$MoSold <- as.factor(total$MoSold)
+total$YrSold <- as.factor(total$YrSold)
+```
+
+We will separate the continuous and categorical variables.
+
+```{r}
+nums <- sapply(total, is.numeric) 
+numeric <- total[,nums]
+```
+
+We need to first take a look at the correlations using correlation plot and heatmap
+
+```{r}
+# Calculating correlation between different variables
+corr <- cor(numeric[,-1], use="complete.obs")
+
+# Plotting the correlation matrix
+corrplot(corr, type="upper", order="hclust", tl.col="black", tl.srt = 45)
+```
+
+We can see from above that, the following varibles pairs are highly corralated with each other with correlationcoefficient more than 0.8:
+GarageArea and GarageCars
+GrLivArea and TotRmsAbvGrd
+TotalBsmtSF and X1stFlrSF
+YearBuilt and GarageYrBlt
+
+### Eliminating continuous variables having high correlation with each other
+
+Now we will calculate correlation of each variable with our response variable i.e SalePrice in the Train dataset.
+
+```{r}
+# Converting total data set back to train and test data
+    inTest <- which(total$Id >= 1461)
+    train <- total[-inTest,]
+    test <- total[inTest,]
+    
+    # Adding SalePrice back in train data set
+    train <- cbind(train,SalePrice=SalePrice)
+
+# Separating the numeric variables in train dataset
+num_train_ind <- sapply(train, is.numeric)
+num_train <- train[,num_train_ind]
+
+# Calculating the correlation
+corPrice <- cor(num_train[,-1],num_train$SalePrice,use="complete.obs")
+
+# the following Variables are with correlation of more than 0.2. (taking absolute value to consider negative correlation too)
+corPrice[abs(corPrice)>0.2,]
+```
+
+Ee will remove the ones having high correlation amonst themselves.
+We will retain GarageCars, GrLivArea, TotalBsmtSF, YearBuilt because of their higher correlation value with SalePrice and will remove: 
+GarageArea, TotRmsAbvGrd, X1stFlrSF and GarageYrBlt.
+
+
+```{r}
+# Eliminating variables having high correlation with each other
+total <- total[,-which(names(total) %in% c("GarageArea", "TotRmsAbvGrd", "X1stFlrSF", "GarageYrBlt"))]
+```
+
+### Finding redundant factor variables in data
+Data in MSSubClass looks like all the information are already present in BldgType and HouseStyle. We will confirm the same after looking at the plots.
+
+```{r}
+# To see relationship of MSSubClass and HouseStyle
+g1 <- train %>% ggplot(aes(MSSubClass,SalePrice, col=HouseStyle)) + geom_point()
+
+g2 <- train %>% ggplot(aes(MSSubClass,SalePrice, col=BldgType)) + geom_point()
+
+grid.arrange(g1,g2,nrow=1)
+```
+
+From the first and second plots it's clear that each MSSubClass is mostly holding details for HouseStyle and BldgType respectively.
+
+We can remove MSSubClass from the list of predictors.
+
+```{r}
+total <- total[,-which(names(total) %in% c("MSSubClass"))]
+```
+
+## Handling of NA values
+
+Let's look at the column names containing NA values.
+
+```{r}
+names(which(sapply(total, anyNA)))
+```
+
+From this list, the following variables can not be set to 0/None as it won't make any sense:
+MSZoning
+Electrical
+Exterior1st
+Exterior2nd
+GarageCars & GarageFinish (Since GarageType is not "NA")
+SaleType
+
+So we will have to set a meaningful value for them. For the following variables, the most occurring values have been used to fill the NA values.
+
+```{r}
+#MSZoning
+total %>% ggplot(aes(as.factor(Neighborhood), fill=MSZoning)) + geom_histogram(stat="count")
+
+# Setting the value to the most frequently used value:
+total[is.na(total$MSZoning)==TRUE,]$MSZoning <- "RM"
+
+# Electrical
+total %>% count(Electrical, sort=TRUE)
+total[is.na(total$Electrical)==TRUE,]$Electrical <- "SBrkr"
+
+#Exterior1st and Exterior2nd
+total %>% ggplot(aes(as.factor(YearBuilt), fill=Exterior1st)) + geom_histogram(stat="count") + theme(axis.text.x = element_text(angle = 90))
+
+# It looks like in 1940's the popular choice for Exterior1st was 
+total[is.na(total$Exterior1st)==TRUE,]$Exterior1st <- "Wd Sdng"
+
+#Similarly filling values for Exterior2nd
+total[is.na(total$Exterior2nd)==TRUE,]$Exterior2nd <- "Wd Sdng"
+
+#SaleType
+total %>% count(SaleType, sort = TRUE)
+
+# Replacing NA with the most occurring value
+total[is.na(total$SaleType)==TRUE,]$SaleType <- "WD"
+```
+
+For 2 records, the values GarageCars and GarageFinish are NA even though GarageType is not NA, which means Garage is available, but values for these variables are not available.
+
+```{r}
+total[!is.na(total$GarageType)==TRUE & is.na(total$GarageCars)==TRUE,50:51] %>% head()
+```
+
+```{r}
+total %>% filter(GarageType=="Detchd") %>%
+    count(GarageFinish)
+```
+
+As we see for most cases where GarageType="Detchd", the value for GarageFinish="Fin"
+Hence replacing NA values accordingly.
+
+```{r}
+total[is.na(total$GarageFinish)==TRUE & !is.na(total$GarageType)==TRUE,]$GarageFinish <- "Fin"
+
+num_tot_ind <- sapply(total, is.numeric)
+num_tot <- total[,num_tot_ind]
+corCar <- cor(num_tot[,-1],num_tot$GarageCars,use="complete.obs")
+```
+
+GarageCars has good correlation with OverallQual, GrLivArea and YearBuilt. Using linear regression with OverallQual, GrLivArea and YearBuilt as parameters to predict the value of missing values for GarageCars.
+
+```{r}
+x <- predict(lm(GarageCars~OverallQual+GrLivArea+YearBuilt,total),newdata=total[is.na(total$GarageCars)==TRUE,])
+
+total[is.na(total$GarageCars)==TRUE,]$GarageCars <- round(x)
+
+```
+
+Filling NA values for variables related to basement where there are no basements.
+
+```{r}
+# Filling NA value for BsmtFinSF1 and BsmtUnfSF
+total[is.na(total$BsmtFinSF1)==TRUE,] %>% select(BsmtQual, BsmtFinSF1,BsmtUnfSF)
+
+# Setting values for BsmtFinSF1 and BsmtUnfSF to 0 as there are no basements
+total[is.na(total$BsmtFinSF1)==TRUE,]$BsmtFinSF1 <- 0
+total[is.na(total$BsmtUnfSF)==TRUE,]$BsmtUnfSF <- 0
+```
+
+Setting missing values to "None" for categorical variables.
+
+```{r}
+## Missing values for factor variables
+total$Alley <- as.character(total$Alley)
+total$Alley[is.na(total$Alley)] <- "None"
+total$Alley <- as.factor(total$Alley)
+
+total$Fence <- as.character(total$Fence)
+total$Fence[is.na(total$Fence)] <- "None"
+total$Fence <- as.factor(total$Fence)
+
+total$GarageType <- as.character(total$GarageType)
+total$GarageType[is.na(total$GarageType)] <- "None"
+total$GarageType <- as.factor(total$GarageType)
+
+total$GarageFinish <- as.character(total$GarageFinish)
+total$GarageFinish[is.na(total$GarageFinish)] <- "None"
+total$GarageFinish <- as.factor(total$GarageFinish)
+
+total$PoolQC <- as.character(total$PoolQC)
+total$PoolQC[is.na(total$PoolQC)] <- "None"
+total$PoolQC <- as.factor(total$PoolQC)
+
+total$MiscFeature <- as.character(total$MiscFeature)
+total$MiscFeature[is.na(total$MiscFeature)] <- "None"
+total$MiscFeature <- as.factor(total$MiscFeature)
+
+# FirePlaceQu is NA where ever Number of fireplaces is 0. We can set it to None
+total$FireplaceQu <- as.character(total$FireplaceQu)
+total$FireplaceQu[is.na(total$FireplaceQu)] <- "None"
+total$FireplaceQu <- as.factor(total$FireplaceQu)
+```
+
+Filling NA values for KitchenQu.
+
+```{r}
+# KitchenQu is NA where number of kitchen above ground floor=1
+test[is.na(test$KitchenQual)==TRUE,] %>% select(KitchenAbvGr, KitchenQual)
+
+# KitchenQu and OverallQual seem related
+total %>% ggplot(aes(KitchenQual, fill=OverallQual)) + geom_histogram(stat="count")
+
+total[total$OverallQual == test[is.na(test$KitchenQual)==TRUE,]$OverallQual,] %>% count(KitchenQual,sort=TRUE)
+```
+
+Maximum value for KitchenQual for the OverallQual as specified in the data where KitchenQual=NA is "TA". Hence we will reaplce the NA values with "TA".
+
+```{r}
+total$KitchenQual <- as.character(total$KitchenQual)
+total$KitchenQual[is.na(total$KitchenQual)] <- "TA"
+total$KitchenQual <- as.factor(total$KitchenQual)
+```
+
+Some variables related to basements have NA (no basement). But the NA values for BsmtQual, BsmtExposure and BsmtFinType1 are inconsistent for some entries.
+So we need to fill values for those variable where the other 2 variables are not NA.
+
+```{r}
+# First We will set NA values to "None" where all three variables are NA
+bsmt_ind <- which(is.na(total$BsmtExposure)==TRUE & is.na(total$BsmtQual)==TRUE & is.na(total$BsmtFinType1)==TRUE)
+
+total$BsmtExposure <- as.character(total$BsmtExposure)
+total[bsmt_ind,]$BsmtExposure <- "None"
+total$BsmtExposure <- as.factor(total$BsmtExposure)
+
+total$BsmtQual <- as.character(total$BsmtQual)
+total[bsmt_ind,]$BsmtQual <- "None"
+total$BsmtQual <- as.factor(total$BsmtQual)
+
+total$BsmtFinType1 <- as.character(total$BsmtFinType1)
+total[bsmt_ind,]$BsmtFinType1 <- "None"
+total$BsmtFinType1 <- as.factor(total$BsmtFinType1)
+
+# Listing out the entries that shows inconsistency
+total[is.na(total$BsmtExposure)==TRUE | is.na(total$BsmtQual)==TRUE | is.na(total$BsmtFinType1)==TRUE,] %>% select(BsmtExposure, BsmtQual, BsmtFinType1)
+```
+
+If we look at the maximum occurring value for BsmtExposure while BsmtFinType1=="Unf" and BsmtQual=="Gd", it's "No". We will use this value to fill up the NA values.
+
+```{r}
+total %>% filter(BsmtFinType1=="Unf" & BsmtQual=="Gd") %>% count(BsmtExposure)
+
+# total[is.na(total$BsmtExposure)==TRUE & !is.na(total$BsmtQual)==TRUE & !is.na(total$BsmtFinType1)==TRUE,]$BsmtExposure <- "No"
+
+total[is.na(total$BsmtExposure)==TRUE,]$BsmtExposure <- "No"
+```
+
+If we look at the maximum occurring value for BsmtQual while BsmtFinType1=="Unf" and BsmtExposure=="No", it's "TA". We will use this value.
+
+```{r}
+total %>% filter(BsmtFinType1=="Unf" & BsmtExposure=="No") %>% count(BsmtQual)
+
+# total[is.na(total$BsmtExposure)==TRUE & !is.na(total$BsmtQual)==TRUE & !is.na(total$BsmtFinType1)==TRUE,]$BsmtQual <- "TA"
+
+total[is.na(total$BsmtQual)==TRUE,]$BsmtQual <- "TA"
+```
+
+Working on missing values for the remaining basement specific variables.
+
+```{r}
+# Basement specific variables are NA because there are no basements Will replace them with 0's
+ 
+total$TotalBsmtSF[is.na(total$TotalBsmtSF)] <- 0 
+
+total$BsmtFullBath[is.na(total$BsmtFullBath)] <- 0
+
+# total$BsmtHalfBath[is.na(total$BsmtHalfBath)] <- 0
+```
+
+LotFrontage is NA for many. We cannot set LofFrontage to 0 for properties which have valid vlaues for LotConfig. We will use random forest to impute these values.
+
+```{r}
+# Using random forest to predict missing values for LotFrontage
+imputed_data_mf <- missForest(total)
+newLF2 <- rowMeans(as.matrix(imputed_data_mf$ximp$LotFrontage))
+total$LotFrontage <- newLF2
+```
+
+Filling up missing values for MasVnrType and MasVnrArea while considering the inconsistencies (similar to the way basement specific values were filled).
+
+```{r}
+
+##MasVnrArea and MasVnrType
+# There is one record with value in MasVnrArea, but NA for MasVnrType. We need to fill some meaningful value for MasVnrType for that record only. Other values will be marked as None
+
+total$MasVnrType <- as.character(total$MasVnrType)
+total[is.na(total$MasVnrType)==TRUE & is.na(total$MasVnrArea)==TRUE,]$MasVnrType <- "None"
+
+total$MasVnrArea[is.na(total$MasVnrArea)] <- 0 
+
+# Finding the most occurred MasVnrType for MasVnrArea around the value present in the data
+total[total$MasVnrArea>150 & total$MasVnrArea<250,] %>% count(MasVnrType, sort=TRUE)
+
+#Setting MasVnrType to the one with highest n value above
+total$MasVnrType[is.na(total$MasVnrType)] <- "BrkFace"
+total$MasVnrType <- as.factor(total$MasVnrType)
+```
+
+In order to reduce the total number of parameters, we can remove the ones with near zero variance.
+
+```{r}
+# Identifying variables with near zero variability
+ind <- nearZeroVar(total)
+
+# Removing variables with near zero variability except OpenPorchSF as it has
+# good correlation value with SalePrice
+ind <- ind[-17]
+
+#Removing variables with near zero variances
+total <- total[,-ind]
+```
+
+# Applying machine learning
+
+Now that our data is almost ready we can apply some machine learning algorithms and predict the SalePrice in test dataset. However there are few more steps we need to do to prepare the data for machine learning.
+
+## Making data ready before applying machine learning
+
+Standardizing the continuous variables in order to avoid bias by certain variables having wider range of values.
+
+```{r, echo=TRUE}
+total$LotFrontage <- standardize(total$LotFrontage)
+total$LotArea <- standardize(total$LotArea)
+total$MasVnrArea <- standardize(total$MasVnrArea)
+total$BsmtFinSF1 <- standardize(total$BsmtFinSF1)
+total$BsmtUnfSF <- standardize(total$BsmtUnfSF)
+total$TotalBsmtSF <- standardize(total$TotalBsmtSF)
+total$X2ndFlrSF <- standardize(total$X2ndFlrSF)
+total$GrLivArea <- standardize(total$GrLivArea)
+total$WoodDeckSF <- standardize(total$WoodDeckSF)
+total$OpenPorchSF <- standardize(total$OpenPorchSF)
+``` 
+
+### Label encoding few factor variables
+Since many machine algorithms only understand numeric inputs, converting factor variables to numeric is essential.
+Variables with qualitative values ranging from "Excellent" to "Poor" can easily be converted to numeric values which will make them look like continuous variables.
+
+```{r, echo=TRUE}
+# Converting the levels of all quality factor variables to 1-5
+levels <- c("Po","Fa","TA","Gd","Ex")
+total$ExterQual <- as.numeric(factor(total$ExterQual, levels = levels))
+total$ExterCond <- as.numeric(factor(total$ExterCond, levels = levels))
+total$BsmtQual <- as.numeric(factor(total$BsmtQual, levels = levels))
+total$BsmtQual[is.na(total$BsmtQual)] <- 0
+total$KitchenQual <- as.numeric(factor(total$KitchenQual, levels = levels))
+total$FireplaceQu <- as.numeric(factor(total$FireplaceQu, levels = levels))
+total$FireplaceQu[is.na(total$FireplaceQu)] <- 0
+total$HeatingQC <- as.numeric(factor(total$HeatingQC, levels = levels))
+total$OverallQual <- as.numeric(total$OverallQual)
+total$OverallCond <- as.numeric(total$OverallCond)
+
+# CentralAir has 2 levels, so making them binary
+total$CentralAir <- as.numeric(factor(total$CentralAir, levels = c("N","Y")))-1
+
+total$LotShape <- as.numeric(factor(total$LotShape, levels = c("IR3","IR2","IR1","Reg")))
+
+total$BsmtExposure <- as.numeric(factor(total$BsmtExposure, levels = c("No","Mn","Av","Gd")))
+total$BsmtExposure[is.na(total$BsmtExposure)] <- 0
+
+levels <- c("Unf","LwQ","Rec","BLQ","ALQ","GLQ")
+total$BsmtFinType1 <- as.numeric(factor(total$BsmtFinType1, levels = levels))
+total$BsmtFinType1[is.na(total$BsmtFinType1)] <- 0
+
+total$GarageFinish <- as.numeric(factor(total$GarageFinish, levels = c("Unf","RFn","Fin")))
+total$GarageFinish[is.na(total$GarageFinish)] <- 0
+```
+
+### One Hot encoding of factor variables
+We will be converting the other kinds of categorical variables into numeric using one-hot encoding as it's easier for machine learning algorithms to interpret that way.
+
+```{r, echo=TRUE}
+# Listing the categorical variables
+nums <- sapply(total, is.numeric) 
+categorical <- total[,!nums]
+
+# One hot encoding
+total <- data.frame(total)
+total <- dummy.data.frame(total, names=colnames(categorical),sep="_")
+```
+
+Now we will divide the dataset back into train and test datasets.
+
+```{r, echo=TRUE}
+set.seed(1)
+inTest <- which(total$Id >= 1461)
+train <- total[-inTest,]
+test <- total[inTest,]
+
+# Adding SalePrice back in train data set
+train <- cbind(train,SalePrice)
+
+```
+
+### Data partitioning for train and cross validating
+We will divide the train dataset into training and testing sets for testing various machine learning algorithms for accuracy before applying on the final test dataset.
+
+```{r, echo=TRUE}
+#Removing Id before splitting
+train <- train[,-which(names(train) %in% c("Id"))]
+
+# Divide this train dataset into training and testing datasets
+set.seed(1)
+inTrain <- createDataPartition(train$SalePrice, p=0.7, list=FALSE)
+
+training <- train[inTrain,]
+testing <- train[-inTrain,]
+```
+
+## Machine Learning Algorithms
+
+We will consider a variety of machine learning algorithms and compare the RMSE for all of them and choose the one with the minimum RMSE.
+
+We will start with naive RMSE i.e. using just the average SalePrice as the expected value.
+
+```{r, echo=TRUE}
+naive_rmse <- RMSE(log(mean(training$SalePrice)),log(testing$SalePrice))
+RMSE_table <- data_frame(method = "Just the average", RMSE = naive_rmse)
+
+# Actual price difference (without taking log)
+naive_price_diff <- RMSE(mean(training$SalePrice),testing$SalePrice)
+
+# Print RMSE table
+print(RMSE_table)
+```
+
+The RMSE value of 0.391 means the difference in actual and predicted house price is around $'r naive_price_diff', which is obviously not very good.
+
+### Linear Regression
+Let's apply the simplest machine learning algorithm "Linear Regression" and look at the RMSE value.
+
+```{r,echo=TRUE}
+# The model
+fit1 <- lm(SalePrice~.,training)
+
+# Predicting in testing dataset
+yhat1 <- predict(fit1, newdata=testing)
+
+# RMSE
+rmse_lm <- RMSE(log(yhat1), log(testing$SalePrice))
+RMSE_table <- rbind(RMSE_table, data.frame(method = "Linear Regression", RMSE = rmse_lm))
+
+# Print RMSE table
+print(RMSE_table)
+```
+
+There is definitely a huge improvement on the RMSE value. However surely we can do better.
+
+```{r}
+# lambdas <- 10^seq(10, -2, length = 100)
+# set.seed(1)
+# 
+# # training - predictor and response matrix
+# X <- as.matrix(training[,-112])
+# Y <- training[,112]
+
+# # testing - predictor and response matrix 
+# X_cv <- as.matrix(testing[,-112])
+# Y_cv <- testing[,112]
+# 
+# #Ridge
+# ridge_reg <- glmnet(X, Y, alpha = 0, lambda = lambdas)
+# summary(ridge_reg)
+# 
+# #find the best lambda via cross validation
+# ridge_reg1 <- cv.glmnet(X, Y, alpha = 0)
+# 
+# bestlam <- ridge_reg$lambda.min
+# ridge.pred <- predict(ridge_reg, s = bestlam, newx = X_cv)
+# 
+# rmse_ridge <- RMSE(log(ridge.pred),log(Y_cv))
+# 
+# #Storing results in RMSE table
+# RMSE_table <- rbind(RMSE_table, data.frame(method = "Ridge", RMSE = rmse_ridge))
+# 
+# # Lasso
+# lasso_reg <- glmnet(X, Y, alpha = 1, lambda = lambda)
+# summary(lasso_reg)
+# 
+# #find the best lambda via cross validation
+# lasso_reg1 <- cv.glmnet(X, Y, alpha = 1)
+# 
+# bestlam_lasso <- lasso_reg1$lambda.min
+# lasso.pred <- predict(lasso_reg, s = bestlam_lasso, newx = X_cv)
+# 
+# rmse_lasso <- RMSE(log(lasso.pred),log(Y_cv))
+# 
+# #Storing results in RMSE table
+# RMSE_table <- rbind(RMSE_table, data.frame(method = "Lasso", RMSE = rmse_lasso))
+# 
+# #Elasticnet
+# set.seed(1)
+# elasticnet <- train(
+#     SalePrice ~., data = training, method = "glmnet",
+#     trControl = trainControl("cv", number = 10),
+#     tuneLength = 10
+# )
+# 
+# # x.test <- model.matrix(SalePrice ~., testing)[,-1]
+# predictions <- model %>% predict(testing)
+# 
+# # Model performance metrics
+# data.frame(
+#     RMSE = RMSE(log(predictions), log(testing$SalePrice)),
+#     Rsquare = R2(predictions, testing$SalePrice)
+# )
+```
+
+### Random forest
+Random forest is one of the models known for giving good accurcay. Let's look at the performance with default parameters.
+
+```{r, echo=TRUE}
+set.seed(1)
+rfModel <- train(SalePrice ~ ., method = "rf", data = training)
+yhat_rf <- predict(rfModel, newdata=testing)
+RMSE_rf <- RMSE(log(yhat_rf),log(testing$SalePrice))
+
+#Storing results in RMSE table
+RMSE_table <- rbind(RMSE_table, data.frame(method = "Random Forest(default values)", RMSE = RMSE_rf))
+
+# Print RMSE table
+print(RMSE_table)
+```
+
+Moch better than linear regression. But we can still do better.
+
+### GBM
+Gradient Boosting Machines is another popular model for achieving great accuracy like Random Forest model.
+
+```{r, echo=TRUE}
+trainControl <- trainControl(method="cv", number=10)
+
+set.seed(1)
+gbm.caret <- train(SalePrice ~ .,
+                   data=training,
+                   distribution="gaussian",
+                   method="gbm",
+                   trControl=trainControl,
+                   verbose=FALSE,
+                   metric="RMSE",
+                   bag.fraction=0.8
+                   )                  
+
+print(gbm.caret)
+
+# Prediction
+predict_gbm <- predict(gbm.caret, newdata=testing)
+
+rmse_gbm <- RMSE(log(testing$SalePrice), log(predict_gbm))
+
+#Storing results in RMSE table
+RMSE_table <- rbind(RMSE_table, data.frame(method = "GBM (default values)", RMSE = rmse_gbm))
+
+# print results
+print(RMSE_table)
+```
+
+If we look at all the RMSE values obtained from various models, we observe that GBM has given us the maximum accuracy i.e. least RMSE.
+We will tune this model and find the best parameters to minimize the RMSE.
+
+```{r hypertuning1,echo=TRUE}
+#Hyper tuning
+# Setting parameters
+hyper_grid <- expand.grid(
+    shrinkage = c(0.01, 0.1, 0.3),
+    interaction.depth = c(1, 3, 5),
+    n.minobsinnode = c(5, 10, 15),
+    bag.fraction = c(.65, .8, 1), 
+    optimal_trees = 0,               # a place to dump results
+    min_RMSE = 0                     # a place to dump results
+)
+
+# total number of combinations
+nrow(hyper_grid)
+
+# Grid search
+for(i in 1:nrow(hyper_grid)) {
+    
+    # reproducibility
+    set.seed(1)
+    
+    # train model
+    gbm.tune <- gbm(
+        formula = SalePrice ~ .,
+        distribution = "gaussian",
+        data = training,
+        n.trees = 5000,
+        interaction.depth = hyper_grid$interaction.depth[i],
+        shrinkage = hyper_grid$shrinkage[i],
+        n.minobsinnode = hyper_grid$n.minobsinnode[i],
+        bag.fraction = hyper_grid$bag.fraction[i],
+        train.fraction = .75,
+        n.cores = NULL, # will use all cores by default
+        verbose = FALSE
+    )
+    
+    # add min training error and trees to grid
+    hyper_grid$optimal_trees[i] <- which.min(gbm.tune$valid.error)
+    hyper_grid$min_RMSE[i] <- sqrt(min(gbm.tune$valid.error))
+}
+
+hyper_grid %>% 
+    dplyr::arrange(min_RMSE) %>%
+    head(10)
+```
+
+These results help us to zoom into areas where we can refine our search. Let's adjust our grid and zoom into closer regions of the values that appear to produce the best results in our previous grid search. 
+Optimal trees aren't crossing 2000, so the model isn't requiring too many trees.
+This grid contains 81 combinations that we'll search across.
+
+```{r hypertuning2, echo=TRUE}
+# modify hyperparameter grid
+hyper_grid2 <- expand.grid(
+  shrinkage = c(.01, .05, .1),
+  interaction.depth = c(3, 5, 7),
+  n.minobsinnode = c(5, 10, 15),
+  bag.fraction = c(.65, .8, 1), 
+  optimal_trees = 0,               # a place to dump results
+  min_RMSE = 0                     # a place to dump results
+)
+
+# total number of combinations
+nrow(hyper_grid2)
+
+set.seed(1)
+# Grid search
+for(i in 1:nrow(hyper_grid2)) {
+    
+    # reproducibility
+    set.seed(1)
+    
+    # train model
+    gbm.tune2 <- gbm(
+        formula = SalePrice ~ .,
+        distribution = "gaussian",
+        data = training,
+        n.trees = 2000,
+        interaction.depth = hyper_grid2$interaction.depth[i],
+        shrinkage = hyper_grid2$shrinkage[i],
+        n.minobsinnode = hyper_grid2$n.minobsinnode[i],
+        bag.fraction = hyper_grid2$bag.fraction[i],
+        train.fraction = .75,
+        n.cores = NULL, # will use all cores by default
+        verbose = FALSE
+    )
+    
+    # add min training error and trees to grid
+    hyper_grid2$optimal_trees[i] <- which.min(gbm.tune2$valid.error)
+    hyper_grid2$min_RMSE[i] <- sqrt(min(gbm.tune2$valid.error))
+}
+
+hyper_grid2 %>% 
+    dplyr::arrange(min_RMSE) %>%
+    head(10)
+```
+
+Once we have found our top model we can train a model with those specific parameters. And since the model converged at 198 trees we train a cross validated model (to provide a more robust error estimate) with 1000 trees.
+
+```{r train, echo=TRUE}
+set.seed(1)
+
+# train GBM model
+gbm.fit.final <- gbm(
+     formula = SalePrice ~ .,
+     distribution = "gaussian",
+     data = training,
+     n.trees = 198,
+     interaction.depth = 7,
+     shrinkage = 0.05,
+     n.minobsinnode = 5,
+     bag.fraction = 0.65,
+     train.fraction = 1,
+     n.cores = NULL, # will use all cores by default
+     verbose = FALSE
+ )
+```
+
+
+### Variable importance
+Let's look at the variable importance as per final GBM model.
+
+```{r}
+# vip::vip(gbm.fit.final)
+```
+
+Now it's time to predict the values in the testing dataset and observe the modified RMSE after hypertuning. Look at the RMSE table below.
+
+```{r predict, echo=TRUE}
+# predict values for test data
+yhat <- predict(gbm.fit.final, newdata = testing, n.trees = gbm.fit.final$n.trees)
+ 
+# results
+rmse_gbm_final <- RMSE(log(yhat),log(testing$SalePrice))
+
+RMSE_table <- rbind(RMSE_table, data.frame(method = "GBM (after hypertuning)", RMSE = rmse_gbm_final))
+
+# print results
+print(RMSE_table)
+```
+
+## Final prediction
+Now that out model is ready, we will use it to train our train dataset and then finally predict on the test dataset and submit on Kaggle.
+
+```{r submission, echo=TRUE}
+# Final prediction for submission
+set.seed(1)
+gbm.fit.final <- gbm(
+    formula = SalePrice ~ .,
+    distribution = "gaussian",
+    data = train,
+    n.trees = 198,
+    interaction.depth = 7,
+    shrinkage = 0.05,
+    n.minobsinnode = 5,
+    bag.fraction = .65,
+    train.fraction = 1,
+    n.cores = NULL, # will use all cores by default
+    verbose = FALSE
+)
+gbm_predict <- predict(gbm.fit.final, test, n.trees=gbm.fit.final$n.trees)
+
+final_test <- cbind(test$Id,gbm_predict)
+write.csv(final_test,"final.csv")
+```
+
+# Conclusion
+After submitting the above final.csv file on Kaggle, the obtained score was 0.13002, which gave a ranking of 1822. This final score from Kaggle may not be this exact score, but may vary slightly with each submission. The best entry on Kaggle was 0.09949. This model undoubtedly has a lot of scope for improvement such as: more feature engineering and trying out models such as XGBoost, which can further reduce the RMSE value. However I was getting better prediction with GBM, which is why I did not include XGBoost. I need to explore more on that area.
+
+Thanks for reviewing the report.
